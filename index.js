@@ -10,64 +10,90 @@ app.get('/play/:id', async (req, res) => {
     const initialUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
     try {
-        console.log(`Starting stream pipeline for ID: ${fileId}`);
-        
-        // 1. קבלת עמוד האזהרה
-        const response = await axios.get(initialUrl, {
+        console.log(`Phase 1: Fetching initial link for ${fileId}`);
+        const initialRes = await axios.get(initialUrl, {
             maxRedirects: 0,
-            validateStatus: status => status >= 200 && status < 400
+            validateStatus: null // לאפשר לכל סטטוס לעבור בלי לזרוק שגיאה
         });
 
-        let finalReqUrl = initialUrl;
+        let directMediaUrl = null;
         let cookies = '';
 
-        // 2. חילוץ הטוקן (אם קיים עמוד אזהרה)
-        if (response.status === 200 && response.data.includes('confirm=')) {
-            const match = response.data.match(/confirm=([a-zA-Z0-9-_]+)/);
-            if (match) {
-                finalReqUrl = `${initialUrl}&confirm=${match[1]}`;
-                const cookieArray = response.headers['set-cookie'];
-                cookies = cookieArray ? cookieArray.join('; ') : '';
+        if (initialRes.status === 302 || initialRes.status === 303) {
+            // קובץ קטן - גוגל מפנה ישירות לווידאו
+            directMediaUrl = initialRes.headers.location;
+        } else if (initialRes.status === 200) {
+            // קובץ גדול - חסימת סריקת וירוסים
+            console.log('Phase 2: Bypassing virus scan warning...');
+            
+            // 1. שמירת עוגיית האבטחה
+            if (initialRes.headers['set-cookie']) {
+                cookies = initialRes.headers['set-cookie'].join('; ');
             }
-        } else if (response.status === 302 || response.status === 303) {
-            // קבצים קטנים שעוברים ישירות
-            finalReqUrl = response.headers.location;
+
+            // 2. חילוץ הלינק המדויק של כפתור ההורדה מה-HTML
+            const match = initialRes.data.match(/href="(\/uc\?export=download(?:&amp;|&)[^"]+)"/i);
+            if (!match) {
+                throw new Error("Could not find download link in warning page.");
+            }
+
+            // ניקוי הלינק מתווי HTML ויצירת לינק מלא
+            const bypassPath = match[1].replace(/&amp;/g, '&');
+            const bypassUrl = `https://drive.google.com${bypassPath}`;
+
+            // 3. הגשת הבקשה עם העוגייה כדי לקבל את הלינק הסופי
+            const bypassRes = await axios.get(bypassUrl, {
+                headers: { 'Cookie': cookies },
+                maxRedirects: 0,
+                validateStatus: null
+            });
+
+            if (bypassRes.status === 302 || bypassRes.status === 303) {
+                directMediaUrl = bypassRes.headers.location;
+            } else {
+                throw new Error("Bypass request did not return a redirect to video.");
+            }
+        } else {
+            throw new Error(`Unexpected status from Drive: ${initialRes.status}`);
         }
 
-        // --- הארכיטקטורה החדשה: Streaming Pipe ---
-        // השרת מתחבר לגוגל, שואב את הווידאו, ומזרים אותו חזרה לטלוויזיה
+        if (!directMediaUrl) {
+            throw new Error("Failed to extract direct media URL.");
+        }
+
+        console.log('Phase 3: Streaming video directly to TV...');
+
+        // הגענו ליעד: מזרימים את הווידאו הנקי לטלוויזיה
         const streamConfig = {
             method: 'GET',
-            url: finalReqUrl,
-            responseType: 'stream', // חובה להזרמת מדיה
+            url: directMediaUrl,
+            responseType: 'stream',
             headers: {}
         };
 
-        if (cookies) streamConfig.headers['Cookie'] = cookies;
-        
-        // העברת בקשת המיקום (הרצה קדימה/אחורה) מהטלוויזיה לגוגל
+        // העברת פקודת "הרצה קדימה" (Range) מהטלוויזיה לגוגל
         if (req.headers.range) {
             streamConfig.headers['Range'] = req.headers.range;
         }
 
-        const streamResponse = await axios(streamConfig);
+        const streamRes = await axios(streamConfig);
 
-        // העברת הסטטוס המדויק לטלוויזיה (למשל 206 Partial Content)
-        res.status(streamResponse.status);
-        
-        // העברת כל הכותרות הרלוונטיות (משקל, סוג קובץ וכו')
-        for (const [key, value] of Object.entries(streamResponse.headers)) {
-            if(key.toLowerCase() !== 'transfer-encoding') {
+        // שיקוף הסטטוס (למשל 206 להזרמה חלקית)
+        res.status(streamRes.status);
+
+        // העברת כל כותרות המדיה (משקל הקובץ, סוג וכו')
+        for (const [key, value] of Object.entries(streamRes.headers)) {
+            if (key.toLowerCase() !== 'transfer-encoding') {
                 res.setHeader(key, value);
             }
         }
 
-        // חיבור הצינור (Pipe) מגוגל, דרך השרת, ישירות לטלוויזיה
-        streamResponse.data.pipe(res);
+        // חיבור הצינור
+        streamRes.data.pipe(res);
 
     } catch (error) {
-        console.error("Pipeline Error:", error.message);
-        res.status(500).send("Error streaming the video.");
+        console.error("Proxy Error:", error.message);
+        res.status(500).send("Video Streaming Error");
     }
 });
 
